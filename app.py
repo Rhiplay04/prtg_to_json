@@ -29,8 +29,12 @@ logger.addHandler(ch)
 
 # --- Zielserver-URL ---
 # Dies löst einen KeyError aus, wenn TARGET_URL nicht gesetzt ist
-TARGET_URL = os.environ['TARGET_URL']
-logging.info(f"Proxy konfiguriert, um Anfragen an {TARGET_URL} weiterzuleiten.")
+TARGET_URL = os.environ.get('TARGET_URL')
+if not TARGET_URL:
+    logger.error("Umgebungsvariable 'TARGET_URL' ist nicht gesetzt. Bitte setze sie, z.B. export TARGET_URL=http://localhost:5000/ziel_endpunkt")
+    exit(1) # Beende das Programm, wenn die URL fehlt
+
+logger.info(f"Proxy konfiguriert, um Anfragen an {TARGET_URL} weiterzuleiten.")
 
 
 @app.route('/convert_and_forward', methods=['POST'])
@@ -43,23 +47,32 @@ def convert_and_forward():
         logger.debug(f"Form-Daten extrahiert: {form_data}")
 
         # Daten in JSON umwandeln
-        # Flask's jsonify gibt ein Response-Objekt zurück, wir wollen den String-Inhalt
         json_data = jsonify(form_data).get_data(as_text=True)
         logger.debug(f"Daten in JSON konvertiert: {json_data}")
 
-        # JSON-Daten an den Zielserver weiterleiten
+        # JSON-Daten an den Zielserver weiterleiten (Fire-and-Forget)
         try:
             headers = {'Content-Type': 'application/json'}
-            logger.info(f"Leite JSON-Daten an Zielserver {TARGET_URL} weiter...")
-            response = requests.post(TARGET_URL, data=json_data, headers=headers)
-            response.raise_for_status()  # Löst einen HTTPError für schlechte Antworten (4xx oder 5xx) aus
+            logger.info(f"Leite JSON-Daten an Zielserver {TARGET_URL} weiter (Fire-and-Forget)...")
+            # timeout=1 kann hier als schneller Timeout dienen, falls der Zielserver nicht erreichbar ist,
+            # aber wir warten absichtlich nicht auf eine detaillierte Antwort.
+            # verify=False ist nur für Testzwecke, in Produktion SSL-Verifizierung aktivieren!
+            requests.post(TARGET_URL, data=json_data, headers=headers, timeout=1, verify=True)
+            logger.info("Anfrage an Zielserver gesendet. Erwarte keine HTTP-Antwort.")
+            # Rückmeldung an den ursprünglichen Absender, dass die Anfrage verarbeitet wurde
+            return jsonify({"message": "Request received and forwarded to target server (fire-and-forget). Erfolgreich gesendet."}), 200
 
-            logger.info(f"Antwort vom Zielserver erhalten (Status {response.status_code}): {response.text}")
-            return jsonify(response.json()), response.status_code
-
+        except requests.exceptions.Timeout:
+            logger.warning(f"Timeout beim Senden an den Zielserver {TARGET_URL}. Dies ist beim Fire-and-Forget-Ansatz erwartet, wenn der Server langsam antwortet oder die Verbindung nicht sofort aufgebaut werden kann.")
+            return jsonify({"message": "Request received and forwarded to target server (fire-and-forget). Send timeout."}), 200
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Verbindungsfehler beim Weiterleiten an den Zielserver {TARGET_URL}: {e}", exc_info=True)
+            # Auch bei Verbindungsfehlern senden wir eine 200, da wir die Anfrage des Absenders "empfangen" haben
+            # und versucht haben, sie weiterzuleiten. Der Absender soll nicht wissen, dass der Zielserver nicht erreichbar war.
+            return jsonify({"message": f"Request received and forwarded to target server (fire-and-forget). Connection error: {e}"}), 200
         except requests.exceptions.RequestException as e:
-            logger.error(f"Fehler beim Weiterleiten an den Zielserver: {e}", exc_info=True) # exc_info=True für Stacktrace
-            return jsonify({"error": f"Fehler beim Weiterleiten an den Zielserver: {e}"}), 500
+            logger.error(f"Unerwarteter Fehler beim Weiterleiten an den Zielserver: {e}", exc_info=True)
+            return jsonify({"message": f"Request received and forwarded to target server (fire-and-forget). Unexpected error: {e}"}), 200
     else:
         logger.warning(f"Untersstützter Content-Type '{request.headers.get('Content-Type')}' empfangen von {request.remote_addr}. Erwarte 'application/x-www-form-urlencoded'.")
         return jsonify({"error": "Unsupported Content-Type. Please use application/x-www-form-urlencoded."}), 400
